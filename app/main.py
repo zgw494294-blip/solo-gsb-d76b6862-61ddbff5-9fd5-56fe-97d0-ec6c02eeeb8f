@@ -9,10 +9,10 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .adjudication import AdjudicationError, adjudicate, diagnose
+from .adjudication import AdjudicationError, adjudicate, diagnose, find_missing
 from .merge import MergeError, preview_merge
 
-app = FastAPI(title="本地赛道计次裁决台", version="1.1.0")
+app = FastAPI(title="本地赛道计次裁决台", version="1.2.0")
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -48,6 +48,26 @@ async def api_diagnose(request: Request) -> JSONResponse:
         )
     try:
         result = diagnose(payload)
+    except AdjudicationError as exc:
+        return JSONResponse(status_code=422, content={"ok": False, "error": str(exc)})
+    return JSONResponse(content={"ok": True, "result": result})
+
+
+@app.post("/api/find-missing")
+async def api_find_missing(request: Request) -> JSONResponse:
+    """漏读时间窗推测：请求体与 /api/adjudicate 完全相同（同一套校验与状态码）。
+
+    纯只读提示：不追加记录，不改变任何裁决行为；对每名选手返回“只补一条
+    某门读数即可让最大计次数 +1”的两条记录 ID 与缺失读数的非负整数秒闭区间。
+    """
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse(
+            status_code=400, content={"ok": False, "error": "请求体不是合法的 JSON"}
+        )
+    try:
+        result = find_missing(payload)
     except AdjudicationError as exc:
         return JSONResponse(status_code=422, content={"ok": False, "error": str(exc)})
     return JSONResponse(content={"ok": True, "result": result})

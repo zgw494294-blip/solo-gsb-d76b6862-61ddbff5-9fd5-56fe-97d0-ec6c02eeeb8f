@@ -510,6 +510,161 @@ def adjudicate(payload: Any) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# 漏读时间窗推测：只补一条某门读数，即可让最大计次数较原输入增加 1 的时间窗。
+#
+# 对每名选手枚举两条不同门记录与缺失门（S/M/F），设虚拟读数秒数为 t：
+# - t 须与这两条记录组成合格趟（两段耗时均落在闭区间内，且 t 为非负整数）；
+# - 须存在一套“记录不共用、相邻趟严格分离”的合法方案包含该趟，且计次数 = 原最大值 + 1。
+#
+# 关键观察：包含该趟的方案中，其余趟只能整体排在它之前（终点 < 本趟起点）或之后
+# （起点 > 本趟终点），且时间分离保证它们不可能与本趟的两条已有记录共用；前、后两段
+# 链拼起来本身也是一套全原始记录的合法方案，故 前置计数 + 后置计数 <= 原最大值，
+# 增次条件恰好是两者之和 == 原最大值。
+#
+# 缺失 F 时前置计数固定、后缀计数随 t 单调不增；缺失 S 时后置计数固定、前缀计数随
+# t 单调不减；缺失 M 时两者都不随 t 变化。因此可行 t 恒为闭区间，用二分求端点即可，
+# 无需逐秒扫描任意大的区间。
+# ---------------------------------------------------------------------------
+
+
+def _find_missing_one(
+    runner: int, records: list[Record], ranges: dict[str, tuple[int, int]]
+) -> dict:
+    mine = [r for r in records if r.runner == runner]
+    trips = _build_trips(mine, ranges)
+    n = len(trips)
+    finish_times = [t.f.time for t in trips]
+
+    # 前缀最大计次数：pref[i] 为只使用 trips[0..i]（终点序）的最大完整链趟数。
+    pref: list[int] = []
+    for i, trip in enumerate(trips):
+        c = 1
+        p = bisect_right(finish_times, trip.s.time - 1, 0, i) - 1
+        if p >= 0:
+            c = pref[p] + 1
+        pref.append(max(c, pref[-1]) if pref else c)
+    # pref_ext[p]：终点严格小于某秒（p = bisect_right(finish_times, 秒-1)）时的最大
+    # 完整链趟数；下标 0 对应空集，随 p 单调不减。
+    pref_ext = [0] + pref
+
+    # 后缀最大计次数：suff[q] 为只使用起点序下标 >= q 的趟（起点 >= start_times[q]）
+    # 的最大完整链趟数；suff[n] = 0 为哨兵，随 q 单调不增。
+    start_order = sorted(range(n), key=lambda i: trips[i].s.time)
+    start_times = [trips[i].s.time for i in start_order]
+    suff = [0] * (n + 1)
+    for k in range(n - 1, -1, -1):
+        trip = trips[start_order[k]]
+        q = bisect_left(start_times, trip.f.time + 1, k + 1, n)
+        take = 1 + suff[q]
+        suff[k] = take if take > suff[k + 1] else suff[k + 1]
+
+    best = pref[-1] if pref else 0
+    sm_lo, sm_hi = ranges["SM"]
+    mf_lo, mf_hi = ranges["MF"]
+
+    def prefix_count(bound: int) -> int:
+        # 终点严格小于 bound 的最大完整链趟数。
+        return pref_ext[bisect_right(finish_times, bound - 1)]
+
+    def suffix_count(bound: int) -> int:
+        # 起点严格大于 bound 的最大完整链趟数。
+        return suff[bisect_left(start_times, bound + 1)]
+
+    by_gate: dict[str, list[Record]] = defaultdict(list)
+    for rec in mine:
+        by_gate[rec.gate].append(rec)
+
+    hints: list[dict] = []
+
+    def emit(gate: str, pair: list[Record], lo: int, hi: int) -> None:
+        hints.append(
+            {
+                "missingGate": gate,
+                "records": [
+                    {"id": r.id, "gate": r.gate, "time": r.time} for r in pair
+                ],
+                "timeMin": lo,
+                "timeMax": hi,
+            }
+        )
+
+    # 缺终点 F：已有 S@s、M@m，虚拟 F@t 须满足 t-m ∈ [mf_lo, mf_hi]。
+    # 前置链（终点 < s.time）固定；后置链（起点 > t）计数须恰好等于 best - 前置。
+    # suff 随下标单调不增：取负后即单调不减，二分求出计数恰为 target 的下标区间，
+    # 再换算回 t 的闭区间。
+    for s in by_gate["S"]:
+        for m in by_gate["M"]:
+            if not (sm_lo <= m.time - s.time <= sm_hi):
+                continue
+            target = best - prefix_count(s.time)
+            q_lo = bisect_left(suff, -target, key=lambda v: -v)
+            q_hi = bisect_left(suff, 1 - target, key=lambda v: -v) - 1
+            if q_lo > q_hi:
+                continue
+            t_lo = 0 if q_lo == 0 else start_times[q_lo - 1]
+            lo = max(t_lo, m.time + mf_lo)
+            hi = m.time + mf_hi if q_hi >= n else min(start_times[q_hi] - 1, m.time + mf_hi)
+            if lo <= hi:
+                emit("F", [s, m], lo, hi)
+
+    # 缺中途门 M：已有 S@s、F@f，虚拟 M@t 须同时满足 t-s ∈ [sm_lo, sm_hi]、
+    # f-t ∈ [mf_lo, mf_hi]。前、后置链边界（s.time / f.time）都不随 t 变化，
+    # 计数条件全有或全无。
+    for s in by_gate["S"]:
+        for f in by_gate["F"]:
+            if prefix_count(s.time) + suffix_count(f.time) != best:
+                continue
+            lo = max(s.time + sm_lo, f.time - mf_hi, 0)
+            hi = min(s.time + sm_hi, f.time - mf_lo)
+            if lo <= hi:
+                emit("M", [s, f], lo, hi)
+
+    # 缺起点 S：已有 M@m、F@f，虚拟 S@t 须满足 m-t ∈ [sm_lo, sm_hi] 且 t >= 0。
+    # 后置链（起点 > f.time）固定；前置链（终点 < t）计数须恰好等于 best - 后置。
+    # pref_ext 单调不减，直接二分计数恰为 target 的下标区间并换算回 t。
+    for m in by_gate["M"]:
+        for f in by_gate["F"]:
+            if not (mf_lo <= f.time - m.time <= mf_hi):
+                continue
+            target = best - suffix_count(f.time)
+            p_lo = bisect_left(pref_ext, target)
+            p_hi = bisect_right(pref_ext, target) - 1
+            if p_lo > p_hi:
+                continue
+            t_lo = 0 if p_lo == 0 else finish_times[p_lo - 1] + 1
+            lo = max(t_lo, m.time - sm_hi, 0)
+            hi = m.time - sm_lo if p_hi >= n else min(finish_times[p_hi], m.time - sm_lo)
+            if lo <= hi:
+                emit("S", [m, f], lo, hi)
+
+    # 缺失门按 S/M/F 次序，再按两条 ID 依门序组成的序列字典序。
+    gate_rank = {g: i for i, g in enumerate(GATES)}
+    hints.sort(
+        key=lambda h: (gate_rank[h["missingGate"]], tuple(r["id"] for r in h["records"]))
+    )
+    return {"runner": runner, "lapCount": best, "hints": hints}
+
+
+def find_missing(payload: Any) -> dict:
+    """漏读时间窗推测入口：请求体与裁决完全相同（同一套校验与状态码）。
+
+    对每名选手枚举任意两条不同门记录及缺失门 S/M/F，返回两条记录与缺失读数的
+    非负整数秒闭区间 [timeMin, timeMax]：区间内每个整数秒都能与这两条记录组成
+    合格趟，并且存在记录不共用、相邻趟严格分离的整套合法方案使最大计次数较原
+    输入增加 1；区间覆盖全部可行秒数。不能增次的记录对不出现。
+    只读提示：不追加记录，不改变裁决、复核、罚秒、名次与诊断；虚拟读数不占
+    40 条录入名额。结果按编号数值升序、缺失门 S/M/F、两条 ID 依门序组成的
+    序列字典序排序。
+    """
+    runner_ids, ranges, records = parse_payload(payload)
+    return {
+        "runners": [
+            _find_missing_one(rid, records, ranges) for rid in sorted(runner_ids)
+        ]
+    }
+
+
 def diagnose(payload: Any) -> dict:
     """替代性诊断入口：输入与裁决完全相同（同一套校验），只诊断未采纳记录。
 

@@ -386,6 +386,34 @@ input:focus, select:focus {
 .chip-mini.f { background: var(--chip-f); border-color: #bbf7d0; }
 .empty-line { color: var(--muted); font-size: 0.84rem; }
 
+/* ---------- 漏读时间窗推测 ---------- */
+#missing-box .diag-intro {
+  margin: 0 0 0.7rem;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+.miss-item {
+  border-left: 3px solid var(--brand);
+  padding: 0.4rem 0.6rem;
+  margin: 0.45rem 0;
+  background: #eff6ff;
+  border-radius: 0 7px 7px 0;
+}
+.miss-window {
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: var(--brand-dark);
+}
+.miss-empty {
+  background: #f9fafb;
+  border: 1px dashed var(--line);
+  color: var(--muted);
+  border-radius: 8px;
+  padding: 0.55rem 0.8rem;
+  font-size: 0.88rem;
+  margin-bottom: 0.6rem;
+}
+
 /* ---------- 设备日志 CSV 导入合并 ---------- */
 .import-controls {
   display: flex;
