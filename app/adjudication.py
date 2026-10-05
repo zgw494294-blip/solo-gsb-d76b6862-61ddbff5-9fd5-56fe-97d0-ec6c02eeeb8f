@@ -524,3 +524,187 @@ def diagnose(payload: Any) -> dict:
     return {
         "runners": [_diagnose_one(rid, records, ranges) for rid in runner_ids]
     }
+
+
+# ---------------------------------------------------------------------------
+# 查找漏读：推测“只补一条读数就能多完成一趟”的时间窗（只读提示，不追加记录）
+# ---------------------------------------------------------------------------
+
+# 缺失门排序键（S < M < F）。
+_GATE_ORDER = {"S": 0, "M": 1, "F": 2}
+
+
+def _count_prefix_max(trips: list[Trip]) -> tuple[list[int], list[int]]:
+    """返回 (终点升序序列 finishes, pref)。
+
+    pref[i] 为只使用 trips[:i+1]（终点均 ≤ finishes[i]）的合法方案最大趟数；
+    与 _best_plan 同一 DAG 的“只比趟数”版本：前驱终点必须严格早于本趟起点。
+    """
+    finishes = [t.f.time for t in trips]
+    pref: list[int] = []
+    for i, trip in enumerate(trips):
+        j = bisect_right(finishes, trip.s.time - 1, 0, i) - 1
+        cnt = 1 + (pref[j] if j >= 0 else 0)
+        pref.append(cnt if not pref else max(cnt, pref[-1]))
+    return finishes, pref
+
+
+def _count_suffix_max(trips: list[Trip]) -> tuple[list[int], list[int]]:
+    """返回 (起点升序序列 starts, suff)。
+
+    suff[k] 为只使用起点 ≥ starts[k] 的趟时合法方案的最大趟数；后继首趟起点
+    必须严格晚于本趟终点（按起点时间二分，与 _suffix_best_by_start 同理）。
+    """
+    order = sorted(range(len(trips)), key=lambda i: trips[i].s.time)
+    starts = [trips[i].s.time for i in order]
+    n = len(trips)
+    suff = [0] * n
+    for k in range(n - 1, -1, -1):
+        trip = trips[order[k]]
+        q = bisect_left(starts, trip.f.time + 1, k + 1, n)
+        cnt = 1 + (suff[q] if q < n else 0)
+        suff[k] = cnt if k == n - 1 else max(cnt, suff[k + 1])
+    return starts, suff
+
+
+def _missing_one(
+    runner: int, records: list[Record], ranges: dict[str, tuple[int, int]]
+) -> dict:
+    """单名选手的漏读窗口：枚举任意两条不同门记录与缺失门 S/M/F，求“只补一条
+    该门虚拟读数即可使最大计次数较原输入增加 1”的缺失读数秒数闭区间。
+
+    数学依据（记原输入最大计次数为 K，只比趟数，不比用时/ID 决胜/罚秒）：
+    - 新增一条读数最多让最大计次数 +1：从新实例的任何方案中删去含新读数的那一趟，
+      剩余仍是原输入的合法方案，故新最大计次数 ∈ {K, K+1}；“增加 1”等价于
+      “存在包含新趟 L 的 K+1 趟合法方案”。
+    - 含新趟 L 的最优方案规模 = A(L.起点-1) + 1 + B(L.终点+1)，其中
+      A(x) = 终点 ≤ x 的合法方案最大趟数、B(y) = 起点 ≥ y 的合法方案最大趟数
+      （均只使用原记录）。前缀各趟终点 ≤ L.起点-1、后缀各趟起点 ≥ L.终点+1，
+      三段两两时间严格分离、记录不可能共用，可直接拼接；反之任何含 L 的合法
+      方案都拆成这样的三段，故该式精确。
+    - 于是秒数 t 可行 ⟺ t 与这两条记录成趟 且 A+B ≥ K。A 随起点不减、
+      B 随终点不增：缺 F 时条件化为 t ≤ 某阈值、缺 S 时化为 t ≥ 某阈值、
+      缺 M 时与 t 无关——三种情形可行集都是闭区间（或空），阈值由二分直接
+      求得，无需逐秒扫描，任意大的秒数全程按任意精度整数计算。
+    """
+    mine = [r for r in records if r.runner == runner]
+    trips = _build_trips(mine, ranges)
+    finishes, pref = _count_prefix_max(trips)
+    starts, suff = _count_suffix_max(trips)
+    base = pref[-1] if pref else 0  # K：原输入的最大计次数
+
+    def count_before(x: int) -> int:
+        """A(x)：终点 ≤ x 的合法方案最大趟数。"""
+        i = bisect_right(finishes, x) - 1
+        return pref[i] if i >= 0 else 0
+
+    def count_after(y: int) -> int:
+        """B(y)：起点 ≥ y 的合法方案最大趟数。"""
+        k = bisect_left(starts, y)
+        return suff[k] if k < len(starts) else 0
+
+    def min_finish_for(need: int) -> int:
+        """最小的 x 使 A(x) ≥ need（调用方保证 1 ≤ need ≤ base）。"""
+        # pref 不减：首个达到 need 的下标对应的终点时间即最小 x。
+        return finishes[bisect_left(pref, need)]
+
+    def max_start_for(need: int) -> int:
+        """最大的 y 使 B(y) ≥ need（调用方保证 1 ≤ need ≤ base）。"""
+        # suff 不增：B(y) ≥ need ⟺ y ≤ starts[最后一个 suff ≥ need 的下标]。
+        lo, hi = 0, len(suff)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if suff[mid] < need:
+                hi = mid
+            else:
+                lo = mid + 1
+        return starts[lo - 1]
+
+    sm_lo, sm_hi = ranges["SM"]
+    mf_lo, mf_hi = ranges["MF"]
+    by_gate = {g: [r for r in mine if r.gate == g] for g in GATES}
+
+    windows: list[dict] = []
+
+    # 缺终点 F：已有 起点S@s、中途门M@m；虚拟 F@t ∈ [m+mfLo, m+mfHi]（t ≥ 1 恒成立）。
+    # 新趟起点固定为 s：A(s-1) 已知，条件 B(t+1) ≥ K-A(s-1) ⟺ t ≤ 阈值。
+    for s in by_gate["S"]:
+        need = base - count_before(s.time - 1)
+        for m in by_gate["M"]:
+            if not sm_lo <= m.time - s.time <= sm_hi:
+                continue
+            t_lo = m.time + mf_lo
+            t_hi = m.time + mf_hi
+            if need >= 1:
+                t_hi = min(t_hi, max_start_for(need) - 1)
+            if t_lo <= t_hi:
+                windows.append(
+                    {
+                        "missingGate": "F",
+                        "ids": [s.id, m.id],
+                        "timeMin": t_lo,
+                        "timeMax": t_hi,
+                    }
+                )
+
+    # 缺起点 S：已有 中途门M@m、终点F@f；虚拟 S@t ∈ [max(0, m-smHi), m-smLo]。
+    # 新趟终点固定为 f：B(f+1) 已知，条件 A(t-1) ≥ K-B(f+1) ⟺ t ≥ 阈值。
+    for f in by_gate["F"]:
+        need = base - count_after(f.time + 1)
+        for m in by_gate["M"]:
+            if not mf_lo <= f.time - m.time <= mf_hi:
+                continue
+            t_lo = max(m.time - sm_hi, 0)
+            t_hi = m.time - sm_lo
+            if need >= 1:
+                t_lo = max(t_lo, min_finish_for(need) + 1)
+            if t_lo <= t_hi:
+                windows.append(
+                    {
+                        "missingGate": "S",
+                        "ids": [m.id, f.id],
+                        "timeMin": t_lo,
+                        "timeMax": t_hi,
+                    }
+                )
+
+    # 缺中途门 M：已有 起点S@s、终点F@f；
+    # 虚拟 M@t ∈ [s+smLo, s+smHi] ∩ [f-mfHi, f-mfLo]。
+    # 新趟起点、终点都固定：条件 A(s-1)+B(f+1) ≥ K 与 t 无关，整体成立或整体不成立。
+    for s in by_gate["S"]:
+        before = count_before(s.time - 1)
+        for f in by_gate["F"]:
+            if before + count_after(f.time + 1) < base:
+                continue
+            t_lo = max(s.time + sm_lo, f.time - mf_hi)
+            t_hi = min(s.time + sm_hi, f.time - mf_lo)
+            if t_lo <= t_hi:
+                windows.append(
+                    {
+                        "missingGate": "M",
+                        "ids": [s.id, f.id],
+                        "timeMin": t_lo,
+                        "timeMax": t_hi,
+                    }
+                )
+
+    # 缺失门 S/M/F 优先，其次按两条 ID（依门序）组成的序列字典序。
+    windows.sort(key=lambda w: (_GATE_ORDER[w["missingGate"]], w["ids"]))
+    return {"runner": runner, "lapCount": base, "windows": windows}
+
+
+def find_missing(payload: Any) -> dict:
+    """查找漏读入口：输入与裁决完全相同（同一套校验），只读分析，不修改任何数据。
+
+    对每名选手枚举任意两条不同门记录及缺失门 S/M/F：若存在非负整数秒，使只补
+    一条该门虚拟读数即可与这两条记录成趟、并在记录不共用、相邻趟严格分离的
+    整套合法方案中让最大计次数较原输入恰好增加 1，则返回这两条记录的 ID
+    （依门序）与缺失读数秒数的闭区间 [timeMin, timeMax]，区间覆盖全部可行
+    秒数；不能增次的记录对不返回。响应按 选手编号数值升序、缺失门 S/M/F、
+    两条 ID 依门序组成的序列字典序 排序。虚拟读数不占用 40 条录入名额；
+    只比计次数，不比用时、ID 决胜或罚秒。
+    """
+    runner_ids, ranges, records = parse_payload(payload)
+    runners = [_missing_one(rid, records, ranges) for rid in runner_ids]
+    runners.sort(key=lambda r: r["runner"])
+    return {"runners": runners}

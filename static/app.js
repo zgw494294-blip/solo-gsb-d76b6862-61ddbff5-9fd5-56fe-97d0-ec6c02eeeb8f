@@ -75,6 +75,7 @@ const errorBox = document.getElementById("error-box");
 const pendingHint = document.getElementById("pending-hint");
 const resultsBox = document.getElementById("results");
 const diagnosisBox = document.getElementById("diagnosis-box");
+const missingBox = document.getElementById("missing-box");
 
 /* ---------- 行管理 ---------- */
 
@@ -183,6 +184,7 @@ function clearOutcome() {
   renderedLapKeys = []; // 结果区已清空，旧的趟键索引全部失效
   latestResult = null; // 名次表随之隐藏，等待最新合法结果
   closeDiagnosis(); // 诊断附属于当前裁决结果：输入一改即清除，非法/重算期间不可检查
+  closeMissing(); // 漏读窗口同样附属于当前裁决结果：输入一改即清除，期间不可查询
 }
 
 /* ---------- 未采纳记录替代性诊断（HTTP 只读分析，不改变采纳/复核/罚秒/名次） ---------- */
@@ -204,6 +206,21 @@ let diagnosisOpen = false;
 if (typeof globalThis !== "undefined") {
   globalThis.__getDiagnosisStateForTest = () => diagnosisState;
   globalThis.__runDiagnosisForTest = () => runDiagnosis();
+}
+
+/* ---------- 查找漏读（HTTP 只读提示：不追加记录，不改变裁决/复核/罚秒/名次/诊断） ---------- */
+
+// 漏读窗口状态机（missingState.status）：idle / loading / done / error，与诊断同款。
+// 入口开关（missingOpen）：仅“最新一次裁决已完成且合法”时打开；每次裁决开始
+// （含输入未变的手动重算）与输入变更/清空都立即关闭并清除旧窗口，期间不可查询；
+// inputVersion 与 adjudicationSeq 双重守卫：清除前发出的查询无论何时结束
+// （成功、服务报错或断网）都不回写界面。虚拟读数只是推测，不占 40 条录入名额。
+let missingState = { status: "idle" };
+let missingOpen = false;
+// 仅供无浏览器生命周期测试直接读取/驱动漏读查询。
+if (typeof globalThis !== "undefined") {
+  globalThis.__getMissingStateForTest = () => missingState;
+  globalThis.__runMissingForTest = () => runMissing();
 }
 
 function onInputChanged() {
@@ -445,9 +462,10 @@ function normalizeResult(result) {
 async function runAdjudication() {
   const version = inputVersion;
   const seq = ++adjudicationSeq;
-  // 每次裁决开始（含输入未变的手动重算）：立即清除旧诊断并禁止检查；
-  // 只有本次（最新）合法裁决完成才由 renderResults 恢复入口，裁决失败保持不可检查。
+  // 每次裁决开始（含输入未变的手动重算）：立即清除旧诊断与旧漏读窗口并禁止查询；
+  // 只有本次（最新）合法裁决完成才由 renderResults 恢复入口，裁决失败保持关闭。
   closeDiagnosis();
+  closeMissing();
   let resp;
   let data;
   try {
@@ -967,6 +985,8 @@ function renderResults(result) {
   // 最新合法裁决到达：诊断入口恢复为可检查的初始态
   // （每次裁决开始时已在 runAdjudication 清除旧诊断并关闭入口）。
   openDiagnosis();
+  // 漏读查询入口同步恢复（旧窗口已在裁决开始/输入变更时清除）。
+  openMissing();
 }
 
 /* ---------- 替代性诊断 ---------- */
@@ -1223,6 +1243,240 @@ diagnosisBox.addEventListener("click", (e) => {
   if (!diagnosisOpen || diagnosisState.status === "loading" || !latestResult) return;
   runDiagnosis();
 });
+
+/* ---------- 查找漏读（只读提示的具体实现） ---------- */
+
+function clearMissing() {
+  missingState = { status: "idle" };
+  if (missingBox) {
+    missingBox.hidden = true;
+    missingBox.innerHTML = "";
+  }
+}
+
+// 每次裁决开始（含输入未变的手动重算）与输入变更/清空：清除旧窗口并关闭查询入口。
+function closeMissing() {
+  missingOpen = false;
+  clearMissing();
+}
+
+// 最新合法裁决到达后进入可查询状态（卡片显示、按钮可点，入口重新打开）。
+function openMissing() {
+  missingOpen = true;
+  missingState = { status: "idle" };
+  paintMissing();
+}
+
+// 漏读响应规范化：编号与区间端点一律规范十进制字符串（任意大整数无损），
+// 缺失门只接受 S/M/F 白名单，其余视为异常响应，避免展示脏数据。
+function normalizeMissing(result) {
+  for (const r of result.runners) {
+    r.runner = typeof r.runner === "string" ? r.runner : String(r.runner);
+    r.lapCount = typeof r.lapCount === "string" ? Number(r.lapCount) : r.lapCount;
+    if (!Array.isArray(r.windows)) throw new Error("漏读服务返回了无法识别的结果");
+    for (const w of r.windows) {
+      if (!(w.missingGate in GATE_LABELS)) {
+        throw new Error("漏读服务返回了无法识别的缺失门");
+      }
+      if (!Array.isArray(w.ids) || w.ids.length !== 2) {
+        throw new Error("漏读窗口缺少两条记录 ID");
+      }
+      w.timeMin = intToText(w.timeMin);
+      w.timeMax = intToText(w.timeMax);
+      if (w.timeMin === null || w.timeMax === null) {
+        throw new Error("漏读服务返回了无法识别的秒数");
+      }
+    }
+  }
+  return result;
+}
+
+async function runMissing() {
+  // 入口关闭（重算在途、非法、清空）、无合法结果、已有查询在途时都不可查询。
+  if (!missingOpen || missingState.status === "loading" || !latestResult) return;
+  const version = inputVersion;
+  const adjSeq = adjudicationSeq; // 重算一开始（序号递增），本次查询的响应即作废
+  missingState = { status: "loading" };
+  paintMissing();
+
+  let resp;
+  let data;
+  try {
+    resp = await fetch("/api/missing", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // 以当前完整裁决输入发起查询（与裁决请求同一份载荷）。
+      body: JSON.stringify(collectPayload()),
+    });
+    data = parseJsonLossless(await resp.text());
+  } catch (err) {
+    // 迟到的失败不得覆盖较新状态（含重算后新查询的在途/成功/失败状态）。
+    if (version !== inputVersion || adjSeq !== adjudicationSeq) return;
+    missingState = { status: "error", message: `无法连接漏读服务：${err.message}` };
+    paintMissing();
+    return;
+  }
+  // 迟到的成功同样丢弃：重算前发出的查询无论何时结束都不得重新显示，
+  // 也不得改写重算后新查询的在途、成功、失败状态。
+  if (version !== inputVersion || adjSeq !== adjudicationSeq) return;
+  if (!resp.ok || !data.ok) {
+    // 当前输入本应与已展示的合法裁决一致；服务报错只在漏读卡内呈现，不动采纳结果。
+    missingState = {
+      status: "error",
+      message: (data && data.error) || `查找漏读失败（HTTP ${resp.status}）`,
+    };
+    paintMissing();
+    return;
+  }
+  try {
+    normalizeMissing(data.result);
+  } catch (err) {
+    missingState = { status: "error", message: err.message };
+    paintMissing();
+    return;
+  }
+  missingState = { status: "done", result: data.result };
+  paintMissing();
+}
+
+function missingHeadHtml() {
+  return `
+    <div class="result-head">
+      <h3>查找漏读（只补一条读数即可多完成一趟）</h3>
+      <span class="review-scope">只读提示：不追加记录，不改变裁决、复核、罚秒、名次与诊断</span>
+    </div>`;
+}
+
+function missingIdleHtml() {
+  return `
+    ${missingHeadHtml()}
+    <p class="diag-intro">
+      以当前完整裁决输入经 HTTP 推测：对每名选手枚举任意两条不同门记录与缺失门 S/M/F，
+      给出“只补一条该门读数就能让最大计次数较现在增加 1”的秒数闭区间（覆盖全部可行秒数；
+      只比计次数，不比用时、ID 决胜或罚秒）。
+    </p>
+    <div class="diag-actions">
+      <button type="button" class="btn primary missing-run">🧭 查找漏读</button>
+      <span class="diag-action-hint">仅在当前输入合法且未在重算时可查询；输入一改或重新计算即清除本窗口。</span>
+    </div>`;
+}
+
+function missingLoadingHtml() {
+  return `
+    ${missingHeadHtml()}
+    <div class="diag-loading">
+      <span class="diag-spinner" aria-hidden="true"></span>
+      正在经 HTTP 推测漏读时间窗…
+    </div>`;
+}
+
+function missingErrorHtml(message) {
+  return `
+    ${missingHeadHtml()}
+    <div class="diag-error">⚠ ${escapeHtml(message)}</div>
+    <div class="diag-actions">
+      <button type="button" class="btn secondary missing-run">重试查找</button>
+    </div>`;
+}
+
+// 单个窗口：两条已有记录（依门序 S→M→F）+ 缺失门 + 秒数闭区间。
+function missingWindowHtml(w) {
+  const presentGates = Object.keys(GATE_LABELS).filter((g) => g !== w.missingGate);
+  const chips = presentGates
+    .map(
+      (g, i) =>
+        `<span class="chip-mini ${g}">${GATE_LABELS[g]} · ${escapeHtml(w.ids[i])}</span>`
+    )
+    .join("");
+  return `
+    <div class="missing-item">
+      <div class="missing-item-line">
+        ${chips}
+        <span class="missing-lead">→ 补 ${GATE_LABELS[w.missingGate]} 读数：</span>
+        <span class="missing-range">${w.timeMin} ～ ${w.timeMax} 秒</span>
+      </div>
+      <div class="diag-hint">闭区间内任取一个整数秒补一条${GATE_LABELS[w.missingGate]}读数，即可与这两条记录成趟，并使该选手最大计次数增加 1；虚拟读数不占 40 条录入名额。</div>
+    </div>`;
+}
+
+function missingRunnerHtml(r) {
+  const head =
+    r.windows.length === 0
+      ? `选手 ${r.runner} · 当前 ${r.lapCount} 次 · 无漏读窗口`
+      : `选手 ${r.runner} · 当前 ${r.lapCount} 次 · 补 1 条即可 ${r.lapCount + 1} 次`;
+  const body =
+    r.windows.length === 0
+      ? `<div class="empty-line">（该选手没有能多完成一趟的漏读窗口）</div>`
+      : r.windows.map(missingWindowHtml).join("");
+  return `
+    <div class="diag-runner">
+      <div class="diag-runner-head">${head}</div>
+      ${body}
+    </div>`;
+}
+
+function missingDoneHtml(result) {
+  const total = result.runners.reduce((n, r) => n + r.windows.length, 0);
+  const rerun = `
+    <div class="diag-actions">
+      <button type="button" class="btn ghost missing-rerun">重新查找</button>
+      <span class="diag-action-hint">修改任意输入或点击重新计算后本窗口立即清除，需在新结果上重新查询。</span>
+    </div>`;
+  if (total === 0) {
+    // 无解明确提示：不逐选手展开，直接给出结论。
+    return `
+      ${missingHeadHtml()}
+      <p class="diag-intro"><strong>无解：</strong>当前输入下，任何两条不同门记录都无法通过只补一条读数（缺失门 S/M/F 任一）再多完成一趟。</p>
+      ${rerun}`;
+  }
+  return `
+    ${missingHeadHtml()}
+    <p class="diag-intro">
+      共找到 <strong>${total}</strong> 个漏读窗口：在每个闭区间内任取一个整数秒补一条对应门的读数，
+      该选手即可多完成一趟。仅作提示：不会追加记录，也不改变裁决、复核、罚秒、名次与诊断。
+    </p>
+    ${result.runners.map(missingRunnerHtml).join("")}
+    ${rerun}`;
+}
+
+function paintMissing() {
+  if (!missingBox) return; // 旧生命周期测试的 DOM 桩没有漏读卡：不重绘
+  // 入口关闭（重算在途、非法、清空）或无合法结果时漏读卡整体隐藏，不可查询。
+  if (!missingOpen || !latestResult) {
+    missingBox.hidden = true;
+    return;
+  }
+  switch (missingState.status) {
+    case "idle":
+      missingBox.innerHTML = missingIdleHtml();
+      break;
+    case "loading":
+      missingBox.innerHTML = missingLoadingHtml();
+      break;
+    case "error":
+      missingBox.innerHTML = missingErrorHtml(missingState.message);
+      break;
+    case "done":
+      missingBox.innerHTML = missingDoneHtml(missingState.result);
+      break;
+  }
+  missingBox.hidden = false;
+}
+
+// 漏读按钮事件委托：loading 态按钮不存在，入口关闭（重算在途、非法、清空）时
+// 卡片隐藏，皆不可点。旧 DOM 桩没有漏读卡时不挂载监听。
+if (missingBox) {
+  missingBox.addEventListener("click", (e) => {
+    if (
+      !e.target.classList.contains("missing-run") &&
+      !e.target.classList.contains("missing-rerun")
+    ) {
+      return;
+    }
+    if (!missingOpen || missingState.status === "loading" || !latestResult) return;
+    runMissing();
+  });
+}
 
 /* ---------- 设备感应日志 CSV 并入（HTTP 预览 → 确认后才追加） ---------- */
 
